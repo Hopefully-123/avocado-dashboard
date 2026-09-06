@@ -1,54 +1,39 @@
 """
 Avocado Prices Interactive Dashboard
-=====================================
-Dataset: Avocado Prices 2020 (Kaggle - timmate/avocado-prices-2020)
-
-Run locally with:
-    pip install streamlit pandas plotly
-    streamlit run app.py
-
-Make sure `avocado-updated-2020.csv` is in the same folder as this script
-(or update the CSV_PATH variable below).
+Dash version for deployment on Render.
 """
 
 from pathlib import Path
+import io
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
 
-# --------------------------------------------------------------------------
-# Page config
-# --------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Avocado Prices Dashboard",
-    page_icon="🥑",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+from dash import Dash, Input, Output, State, callback, dash_table, dcc, html
+from flask import send_file
+
+
+# ============================================================
+# Data
+# ============================================================
 
 CSV_PATH = Path(__file__).with_name("avocado-updated-2020.csv")
 
-# The HAB's `geography` column mixes three different levels of granularity:
-#   - "Total U.S."       -> the whole country
-#   - 8 broad areas       -> California, Great Lakes, Midsouth, Northeast,
-#                            Plains, Southeast, South Central, West
-#   - individual cities/metros/states -> everything else (San Francisco,
-#                                          Chicago, South Carolina, etc.)
-# Per the dataset notes, Total U.S. is NOT simply the sum of the 8 areas,
-# and the 8 areas are themselves aggregates of the cities within them.
-# Summing across mixed levels (e.g. "Total U.S." + "California" + "Los
-# Angeles") double- or triple-counts volume, so we tag each row with its
-# level and warn the user if they select a mix.
 TOTAL_US = "Total U.S."
+
 AGGREGATE_AREAS = {
-    "California", "Great Lakes", "Midsouth", "Northeast",
-    "Plains", "Southeast", "South Central", "West",
+    "California",
+    "Great Lakes",
+    "Midsouth",
+    "Northeast",
+    "Plains",
+    "Southeast",
+    "South Central",
+    "West",
 }
 
 
-def classify_geography(geo: str) -> str:
+def classify_geography(geo):
     if geo == TOTAL_US:
         return "Total U.S."
     if geo in AGGREGATE_AREAS:
@@ -56,266 +41,832 @@ def classify_geography(geo: str) -> str:
     return "City / State"
 
 
-# --------------------------------------------------------------------------
-# Data loading
-# --------------------------------------------------------------------------
-@st.cache_data
-def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df["date"] = pd.to_datetime(df["date"])
-    df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
-    df["geo_level"] = df["geography"].apply(classify_geography)
-    return df
+def load_data(path):
+    data = pd.read_csv(path)
+    data["date"] = pd.to_datetime(data["date"])
+    data["month"] = data["date"].dt.to_period("M").dt.to_timestamp()
+    data["geo_level"] = data["geography"].apply(classify_geography)
+    return data
 
 
 df = load_data(CSV_PATH)
 
-# --------------------------------------------------------------------------
-# Sidebar filters
-# --------------------------------------------------------------------------
-st.sidebar.title("🥑 Filters")
+min_date = df["date"].min()
+max_date = df["date"].max()
 
-min_date, max_date = df["date"].min(), df["date"].max()
-date_range = st.sidebar.date_input(
-    "Date range",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
-)
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_date, end_date = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
-else:
-    start_date, end_date = min_date, max_date
+all_types = sorted(df["type"].dropna().unique())
 
-avocado_type = st.sidebar.multiselect(
-    "Avocado type",
-    options=sorted(df["type"].unique()),
-    default=sorted(df["type"].unique()),
+city_regions = sorted(
+    df.loc[df["geo_level"] == "City / State", "geography"].dropna().unique()
 )
 
-st.sidebar.markdown("**Geography level**")
-level_choice = st.sidebar.radio(
-    "Which level of geography to show",
-    options=["City / State only", "Aggregate regions only", "Total U.S. only", "Custom (pick any)"],
-    index=0,
-    label_visibility="collapsed",
-)
+default_regions = [
+    region
+    for region in ["Los Angeles", "New York", "Chicago"]
+    if region in city_regions
+]
 
-if level_choice == "City / State only":
-    region_pool = sorted(df.loc[df["geo_level"] == "City / State", "geography"].unique())
-elif level_choice == "Aggregate regions only":
-    region_pool = sorted(df.loc[df["geo_level"] == "Aggregate region", "geography"].unique())
-elif level_choice == "Total U.S. only":
-    region_pool = [TOTAL_US]
-else:
-    region_pool = sorted(df["geography"].unique())
-
-default_regions = [r for r in ["Los Angeles", "New York", "Chicago", TOTAL_US] if r in region_pool]
 if not default_regions:
-    default_regions = region_pool[:3]
+    default_regions = city_regions[:3]
 
-regions = st.sidebar.multiselect(
-    "Region(s)",
-    options=region_pool,
-    default=default_regions,
+
+# ============================================================
+# Dash application
+# ============================================================
+
+app = Dash(__name__)
+server = app.server
+
+app.title = "Avocado Prices Dashboard"
+
+
+# ============================================================
+# Styles
+# ============================================================
+
+PAGE_STYLE = {
+    "fontFamily": "Arial, sans-serif",
+    "backgroundColor": "#f6f8f5",
+    "minHeight": "100vh",
+    "margin": "0",
+}
+
+SIDEBAR_STYLE = {
+    "width": "280px",
+    "padding": "25px",
+    "backgroundColor": "#ffffff",
+    "borderRight": "1px solid #dddddd",
+}
+
+CONTENT_STYLE = {
+    "flex": "1",
+    "padding": "30px",
+    "minWidth": "0",
+}
+
+CARD_STYLE = {
+    "backgroundColor": "white",
+    "padding": "20px",
+    "borderRadius": "10px",
+    "boxShadow": "0 1px 4px rgba(0,0,0,0.10)",
+    "textAlign": "center",
+    "flex": "1",
+    "minWidth": "170px",
+}
+
+GRAPH_CARD_STYLE = {
+    "backgroundColor": "white",
+    "padding": "18px",
+    "borderRadius": "10px",
+    "boxShadow": "0 1px 4px rgba(0,0,0,0.08)",
+    "marginBottom": "20px",
+}
+
+
+# ============================================================
+# Layout
+# ============================================================
+
+app.layout = html.Div(
+    style=PAGE_STYLE,
+    children=[
+        html.Div(
+            style={"display": "flex"},
+            children=[
+
+                # ---------------- Sidebar ----------------
+                html.Div(
+                    style=SIDEBAR_STYLE,
+                    children=[
+                        html.H2("🥑 Filters"),
+
+                        html.Label("Date range"),
+                        dcc.DatePickerRange(
+                            id="date-range",
+                            min_date_allowed=min_date.date(),
+                            max_date_allowed=max_date.date(),
+                            start_date=min_date.date(),
+                            end_date=max_date.date(),
+                            display_format="YYYY-MM-DD",
+                            style={"marginBottom": "20px"},
+                        ),
+
+                        html.Br(),
+                        html.Br(),
+
+                        html.Label("Avocado type"),
+                        dcc.Dropdown(
+                            id="avocado-type",
+                            options=[
+                                {"label": value, "value": value}
+                                for value in all_types
+                            ],
+                            value=all_types,
+                            multi=True,
+                            clearable=False,
+                        ),
+
+                        html.Br(),
+
+                        html.Label("Geography level"),
+                        dcc.RadioItems(
+                            id="geo-level",
+                            options=[
+                                {
+                                    "label": "City / State only",
+                                    "value": "City / State only",
+                                },
+                                {
+                                    "label": "Aggregate regions only",
+                                    "value": "Aggregate regions only",
+                                },
+                                {
+                                    "label": "Total U.S. only",
+                                    "value": "Total U.S. only",
+                                },
+                                {
+                                    "label": "Custom (pick any)",
+                                    "value": "Custom (pick any)",
+                                },
+                            ],
+                            value="City / State only",
+                            labelStyle={
+                                "display": "block",
+                                "margin": "8px 0",
+                            },
+                        ),
+
+                        html.Br(),
+
+                        html.Label("Region(s)"),
+                        dcc.Dropdown(
+                            id="regions",
+                            options=[
+                                {"label": r, "value": r}
+                                for r in city_regions
+                            ],
+                            value=default_regions,
+                            multi=True,
+                        ),
+
+                        html.Div(
+                            id="geo-warning",
+                            style={
+                                "marginTop": "15px",
+                                "fontSize": "13px",
+                                "color": "#9a6700",
+                            },
+                        ),
+
+                        html.Hr(),
+
+                        html.P(
+                            "Data: Avocado Prices 2020",
+                            style={
+                                "fontSize": "12px",
+                                "color": "#666",
+                            },
+                        ),
+                    ],
+                ),
+
+                # ---------------- Main content ----------------
+                html.Div(
+                    style=CONTENT_STYLE,
+                    children=[
+                        html.H1("🥑 Avocado Prices Dashboard"),
+
+                        html.P(
+                            id="summary-text",
+                            style={"color": "#666"},
+                        ),
+
+                        # KPI cards
+                        html.Div(
+                            style={
+                                "display": "flex",
+                                "gap": "15px",
+                                "flexWrap": "wrap",
+                                "margin": "25px 0",
+                            },
+                            children=[
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.H4("Avg. Price"),
+                                        html.H2(id="kpi-price"),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.H4("Total Volume"),
+                                        html.H2(id="kpi-volume"),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.H4("Total Bags Sold"),
+                                        html.H2(id="kpi-bags"),
+                                    ],
+                                ),
+                                html.Div(
+                                    style=CARD_STYLE,
+                                    children=[
+                                        html.H4("Price Change"),
+                                        html.H2(id="kpi-change"),
+                                    ],
+                                ),
+                            ],
+                        ),
+
+                        # Tabs
+                        dcc.Tabs(
+                            id="tabs",
+                            value="price-trends",
+                            children=[
+                                dcc.Tab(
+                                    label="📈 Price Trends",
+                                    value="price-trends",
+                                ),
+                                dcc.Tab(
+                                    label="🌎 Regional Comparison",
+                                    value="regional",
+                                ),
+                                dcc.Tab(
+                                    label="📦 Volume & Bag Mix",
+                                    value="volume",
+                                ),
+                                dcc.Tab(
+                                    label="🔍 Raw Data",
+                                    value="raw",
+                                ),
+                            ],
+                        ),
+
+                        html.Div(
+                            id="tab-content",
+                            style={"marginTop": "25px"},
+                        ),
+                    ],
+                ),
+            ],
+        )
+    ],
 )
 
-# Warn if the user picked a "Custom" mix that spans levels, since summed
-# metrics (volume, bags) would double-count across Total U.S. / area / city.
-if level_choice == "Custom (pick any)" and regions:
-    levels_selected = {classify_geography(r) for r in regions}
-    if len(levels_selected) > 1:
-        st.sidebar.warning(
-            "You've selected regions from different levels (e.g. a city and "
-            "its parent area, or Total U.S.). Per the HAB's own data notes, "
-            "these don't sum cleanly — summed metrics (volume, bags) will "
-            "double-count. Price averages are still fine to compare."
+
+# ============================================================
+# Geography dropdown callback
+# ============================================================
+
+@callback(
+    Output("regions", "options"),
+    Output("regions", "value"),
+    Output("geo-warning", "children"),
+    Input("geo-level", "value"),
+)
+def update_region_options(level_choice):
+
+    if level_choice == "City / State only":
+        pool = sorted(
+            df.loc[
+                df["geo_level"] == "City / State",
+                "geography",
+            ].unique()
         )
 
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    "Data: [Avocado Prices 2020, Kaggle](https://www.kaggle.com/datasets/timmate/avocado-prices-2020/data)"
-)
+    elif level_choice == "Aggregate regions only":
+        pool = sorted(
+            df.loc[
+                df["geo_level"] == "Aggregate region",
+                "geography",
+            ].unique()
+        )
 
-# --------------------------------------------------------------------------
-# Filtered data
-# --------------------------------------------------------------------------
-mask = (
-    (df["date"] >= start_date)
-    & (df["date"] <= end_date)
-    & (df["type"].isin(avocado_type))
-    & (df["geography"].isin(regions if regions else region_pool))
-)
-fdf = df.loc[mask].copy()
+    elif level_choice == "Total U.S. only":
+        pool = [TOTAL_US]
 
-st.title("🥑 Avocado Prices Dashboard")
-st.caption(
-    f"Showing {len(fdf):,} records across {fdf['geography'].nunique()} region(s), "
-    f"{start_date.date()} to {end_date.date()}."
-)
+    else:
+        pool = sorted(df["geography"].unique())
 
-if fdf.empty:
-    st.warning("No data matches the current filters. Adjust the filters in the sidebar.")
-    st.stop()
-
-# --------------------------------------------------------------------------
-# KPI row
-# --------------------------------------------------------------------------
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric("Avg. Price", f"${fdf['average_price'].mean():.2f}")
-with col2:
-    st.metric("Total Volume", f"{fdf['total_volume'].sum():,.0f}")
-with col3:
-    st.metric("Total Bags Sold", f"{fdf['total_bags'].sum():,.0f}")
-with col4:
-    price_delta = (
-        fdf.sort_values("date").groupby("date")["average_price"].mean().iloc[-1]
-        - fdf.sort_values("date").groupby("date")["average_price"].mean().iloc[0]
-    )
-    st.metric("Price Change (period)", f"${price_delta:+.2f}")
-
-st.markdown("---")
-
-# --------------------------------------------------------------------------
-# Tabs
-# --------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📈 Price Trends", "🌎 Regional Comparison", "📦 Volume & Bag Mix", "🔍 Raw Data"]
-)
-
-# --- Tab 1: Price trends over time ----------------------------------------
-with tab1:
-    st.subheader("Average Price Over Time")
-
-    granularity = st.radio(
-        "Granularity", ["Weekly", "Monthly"], horizontal=True, key="gran1"
-    )
-    time_col = "date" if granularity == "Weekly" else "month"
-
-    trend = (
-        fdf.groupby([time_col, "type", "geography"])["average_price"]
-        .mean()
-        .reset_index()
-    )
-
-    color_dim = "geography" if len(regions) > 1 else "type"
-    fig = px.line(
-        trend,
-        x=time_col,
-        y="average_price",
-        color=color_dim,
-        line_dash="type" if color_dim == "geography" else None,
-        markers=False,
-        labels={"average_price": "Avg. Price ($)", time_col: "Date"},
-    )
-    fig.update_layout(hovermode="x unified", legend_title_text=color_dim.title())
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Price Distribution by Type")
-    fig2 = px.box(
-        fdf, x="type", y="average_price", color="type",
-        labels={"average_price": "Avg. Price ($)", "type": "Type"},
-    )
-    st.plotly_chart(fig2, use_container_width=True)
-
-# --- Tab 2: Regional comparison --------------------------------------------
-with tab2:
-    st.subheader("Average Price by Region")
-    st.caption(
-        "Ranked within one geography level at a time (city/state, aggregate "
-        "region, or Total U.S.) so the comparison is apples-to-apples — "
-        "price averages are fine to compare across levels, but this chart "
-        "keeps it to one level for clarity."
-    )
-
-    rank_level = st.selectbox(
-        "Rank regions within:",
-        options=["City / State", "Aggregate region", "Total U.S."],
-        index=0,
-    )
-
-    ranked_pool = df[
-        (df["date"] >= start_date)
-        & (df["date"] <= end_date)
-        & (df["type"].isin(avocado_type))
-        & (df["geo_level"] == rank_level)
+    defaults = [
+        r
+        for r in ["Los Angeles", "New York", "Chicago", TOTAL_US]
+        if r in pool
     ]
 
-    region_avg = (
-        ranked_pool.groupby("geography")["average_price"]
+    if not defaults:
+        defaults = pool[:3]
+
+    options = [{"label": r, "value": r} for r in pool]
+
+    warning = ""
+
+    if level_choice == "Custom (pick any)":
+        warning = (
+            "Note: selecting geography levels that overlap can "
+            "double-count volume and bag totals."
+        )
+
+    return options, defaults, warning
+
+
+# ============================================================
+# Main dashboard callback
+# ============================================================
+
+@callback(
+    Output("summary-text", "children"),
+    Output("kpi-price", "children"),
+    Output("kpi-volume", "children"),
+    Output("kpi-bags", "children"),
+    Output("kpi-change", "children"),
+    Output("tab-content", "children"),
+    Input("date-range", "start_date"),
+    Input("date-range", "end_date"),
+    Input("avocado-type", "value"),
+    Input("regions", "value"),
+    Input("tabs", "value"),
+)
+def update_dashboard(
+    start_date,
+    end_date,
+    avocado_types,
+    regions,
+    selected_tab,
+):
+
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+
+    if not avocado_types:
+        avocado_types = all_types
+
+    if not regions:
+        regions = sorted(df["geography"].unique())
+
+    mask = (
+        (df["date"] >= start_date)
+        & (df["date"] <= end_date)
+        & (df["type"].isin(avocado_types))
+        & (df["geography"].isin(regions))
+    )
+
+    fdf = df.loc[mask].copy()
+
+    if fdf.empty:
+        message = "No data matches the current filters."
+
+        return (
+            message,
+            "—",
+            "—",
+            "—",
+            "—",
+            html.Div(
+                message,
+                style={
+                    "padding": "30px",
+                    "backgroundColor": "#fff3cd",
+                },
+            ),
+        )
+
+    summary = (
+        f"Showing {len(fdf):,} records across "
+        f"{fdf['geography'].nunique()} region(s), "
+        f"{start_date.date()} to {end_date.date()}."
+    )
+
+    avg_price = f"${fdf['average_price'].mean():.2f}"
+    total_volume = f"{fdf['total_volume'].sum():,.0f}"
+    total_bags = f"{fdf['total_bags'].sum():,.0f}"
+
+    daily_price = (
+        fdf.sort_values("date")
+        .groupby("date")["average_price"]
         .mean()
-        .sort_values(ascending=False)
-        .reset_index()
     )
 
-    fig3 = px.bar(
-        region_avg,
-        x="average_price",
-        y="geography",
-        orientation="h",
-        height=max(300, 25 * len(region_avg)),
-        labels={"average_price": "Avg. Price ($)", "geography": "Region"},
-        color="average_price",
-        color_continuous_scale="Greens",
-    )
-    fig3.update_layout(yaxis={"categoryorder": "total ascending"})
-    st.plotly_chart(fig3, use_container_width=True)
+    price_delta = daily_price.iloc[-1] - daily_price.iloc[0]
+    price_change = f"${price_delta:+.2f}"
 
-    st.subheader("Selected Regions: Price vs Volume")
-    scatter_df = fdf.groupby("geography").agg(
-        avg_price=("average_price", "mean"),
-        total_volume=("total_volume", "sum"),
-    ).reset_index()
-    fig4 = px.scatter(
-        scatter_df,
-        x="total_volume",
-        y="avg_price",
-        text="geography",
-        size="total_volume",
-        labels={"total_volume": "Total Volume", "avg_price": "Avg. Price ($)"},
-    )
-    fig4.update_traces(textposition="top center")
-    fig4.update_xaxes(type="log")
-    st.plotly_chart(fig4, use_container_width=True)
+    # ========================================================
+    # Price Trends tab
+    # ========================================================
 
-# --- Tab 3: Volume & bag mix -------------------------------------------
-with tab3:
-    st.subheader("Volume by PLU (Avocado Size Code)")
-    plu = fdf[["4046", "4225", "4770"]].sum().rename(
-        {"4046": "Small (4046)", "4225": "Medium (4225)", "4770": "Large (4770)"}
-    )
-    fig5 = px.pie(values=plu.values, names=plu.index, hole=0.4)
-    st.plotly_chart(fig5, use_container_width=True)
+    if selected_tab == "price-trends":
 
-    st.subheader("Bag Size Mix")
-    bags = fdf[["small_bags", "large_bags", "xlarge_bags"]].sum().rename(
-        {"small_bags": "Small Bags", "large_bags": "Large Bags", "xlarge_bags": "XLarge Bags"}
-    )
-    fig6 = px.pie(values=bags.values, names=bags.index, hole=0.4)
-    st.plotly_chart(fig6, use_container_width=True)
+        trend = (
+            fdf.groupby(
+                ["date", "type", "geography"]
+            )["average_price"]
+            .mean()
+            .reset_index()
+        )
 
-    st.subheader("Total Volume Over Time")
-    vol_trend = fdf.groupby(["month", "type"])["total_volume"].sum().reset_index()
-    fig7 = px.area(
-        vol_trend, x="month", y="total_volume", color="type",
-        labels={"total_volume": "Total Volume", "month": "Month"},
-    )
-    st.plotly_chart(fig7, use_container_width=True)
+        color_dim = (
+            "geography"
+            if len(regions) > 1
+            else "type"
+        )
 
-# --- Tab 4: Raw data --------------------------------------------------------
-with tab4:
-    st.subheader("Filtered Raw Data")
-    st.caption(
-        "The `geo_level` column tags each row as City / State, Aggregate "
-        "region, or Total U.S. — useful if you're exporting for further "
-        "analysis and want to avoid double-counting."
+        fig1 = px.line(
+            trend,
+            x="date",
+            y="average_price",
+            color=color_dim,
+            line_dash=(
+                "type"
+                if color_dim == "geography"
+                else None
+            ),
+            labels={
+                "average_price": "Avg. Price ($)",
+                "date": "Date",
+            },
+            title="Average Price Over Time",
+        )
+
+        fig1.update_layout(
+            hovermode="x unified",
+        )
+
+        fig2 = px.box(
+            fdf,
+            x="type",
+            y="average_price",
+            color="type",
+            labels={
+                "average_price": "Avg. Price ($)",
+                "type": "Type",
+            },
+            title="Price Distribution by Type",
+        )
+
+        tab_content = html.Div(
+            [
+                html.Div(
+                    dcc.Graph(figure=fig1),
+                    style=GRAPH_CARD_STYLE,
+                ),
+                html.Div(
+                    dcc.Graph(figure=fig2),
+                    style=GRAPH_CARD_STYLE,
+                ),
+            ]
+        )
+
+    # ========================================================
+    # Regional Comparison tab
+    # ========================================================
+
+    elif selected_tab == "regional":
+
+        rank_level = (
+            fdf["geo_level"].iloc[0]
+            if fdf["geo_level"].nunique() == 1
+            else "City / State"
+        )
+
+        ranked_pool = df[
+            (df["date"] >= start_date)
+            & (df["date"] <= end_date)
+            & (df["type"].isin(avocado_types))
+            & (df["geo_level"] == rank_level)
+        ]
+
+        region_avg = (
+            ranked_pool
+            .groupby("geography")["average_price"]
+            .mean()
+            .sort_values(ascending=False)
+            .reset_index()
+        )
+
+        fig3 = px.bar(
+            region_avg,
+            x="average_price",
+            y="geography",
+            orientation="h",
+            height=max(
+                400,
+                25 * len(region_avg),
+            ),
+            labels={
+                "average_price": "Avg. Price ($)",
+                "geography": "Region",
+            },
+            color="average_price",
+            color_continuous_scale="Greens",
+            title="Average Price by Region",
+        )
+
+        fig3.update_layout(
+            yaxis={
+                "categoryorder": "total ascending"
+            }
+        )
+
+        scatter_df = (
+            fdf.groupby("geography")
+            .agg(
+                avg_price=(
+                    "average_price",
+                    "mean",
+                ),
+                total_volume=(
+                    "total_volume",
+                    "sum",
+                ),
+            )
+            .reset_index()
+        )
+
+        fig4 = px.scatter(
+            scatter_df,
+            x="total_volume",
+            y="avg_price",
+            text="geography",
+            size="total_volume",
+            labels={
+                "total_volume": "Total Volume",
+                "avg_price": "Avg. Price ($)",
+            },
+            title="Selected Regions: Price vs Volume",
+        )
+
+        fig4.update_traces(
+            textposition="top center"
+        )
+
+        fig4.update_xaxes(type="log")
+
+        tab_content = html.Div(
+            [
+                html.P(
+                    "Regions are ranked within one geography "
+                    "level to avoid misleading comparisons."
+                ),
+                html.Div(
+                    dcc.Graph(figure=fig3),
+                    style=GRAPH_CARD_STYLE,
+                ),
+                html.Div(
+                    dcc.Graph(figure=fig4),
+                    style=GRAPH_CARD_STYLE,
+                ),
+            ]
+        )
+
+    # ========================================================
+    # Volume & Bag Mix tab
+    # ========================================================
+
+    elif selected_tab == "volume":
+
+        plu = (
+            fdf[["4046", "4225", "4770"]]
+            .sum()
+            .rename(
+                {
+                    "4046": "Small (4046)",
+                    "4225": "Medium (4225)",
+                    "4770": "Large (4770)",
+                }
+            )
+        )
+
+        fig5 = px.pie(
+            values=plu.values,
+            names=plu.index,
+            hole=0.4,
+            title="Volume by PLU (Avocado Size Code)",
+        )
+
+        bags = (
+            fdf[
+                [
+                    "small_bags",
+                    "large_bags",
+                    "xlarge_bags",
+                ]
+            ]
+            .sum()
+            .rename(
+                {
+                    "small_bags": "Small Bags",
+                    "large_bags": "Large Bags",
+                    "xlarge_bags": "XLarge Bags",
+                }
+            )
+        )
+
+        fig6 = px.pie(
+            values=bags.values,
+            names=bags.index,
+            hole=0.4,
+            title="Bag Size Mix",
+        )
+
+        vol_trend = (
+            fdf.groupby(
+                ["month", "type"]
+            )["total_volume"]
+            .sum()
+            .reset_index()
+        )
+
+        fig7 = px.area(
+            vol_trend,
+            x="month",
+            y="total_volume",
+            color="type",
+            labels={
+                "total_volume": "Total Volume",
+                "month": "Month",
+            },
+            title="Total Volume Over Time",
+        )
+
+        tab_content = html.Div(
+            [
+                html.Div(
+                    style={
+                        "display": "flex",
+                        "gap": "20px",
+                        "flexWrap": "wrap",
+                    },
+                    children=[
+                        html.Div(
+                            dcc.Graph(figure=fig5),
+                            style={
+                                **GRAPH_CARD_STYLE,
+                                "flex": "1",
+                                "minWidth": "350px",
+                            },
+                        ),
+                        html.Div(
+                            dcc.Graph(figure=fig6),
+                            style={
+                                **GRAPH_CARD_STYLE,
+                                "flex": "1",
+                                "minWidth": "350px",
+                            },
+                        ),
+                    ],
+                ),
+                html.Div(
+                    dcc.Graph(figure=fig7),
+                    style=GRAPH_CARD_STYLE,
+                ),
+            ]
+        )
+
+    # ========================================================
+    # Raw Data tab
+    # ========================================================
+
+    else:
+
+        table_df = (
+            fdf.sort_values(
+                "date",
+                ascending=False,
+            )
+            .copy()
+        )
+
+        table_df["date"] = (
+            table_df["date"]
+            .dt.strftime("%Y-%m-%d")
+        )
+
+        if "month" in table_df.columns:
+            table_df["month"] = (
+                table_df["month"]
+                .dt.strftime("%Y-%m")
+            )
+
+        tab_content = html.Div(
+            [
+                html.H3("Filtered Raw Data"),
+
+                html.P(
+                    "The geo_level column identifies City / "
+                    "State, Aggregate region, or Total U.S."
+                ),
+
+                html.Button(
+                    "Download filtered data as CSV",
+                    id="download-button",
+                    n_clicks=0,
+                    style={
+                        "padding": "10px 16px",
+                        "marginBottom": "15px",
+                        "cursor": "pointer",
+                    },
+                ),
+
+                dcc.Download(
+                    id="download-data"
+                ),
+
+                dash_table.DataTable(
+                    data=table_df.to_dict("records"),
+                    columns=[
+                        {
+                            "name": column,
+                            "id": column,
+                        }
+                        for column in table_df.columns
+                    ],
+                    page_size=20,
+                    sort_action="native",
+                    filter_action="native",
+                    style_table={
+                        "overflowX": "auto",
+                    },
+                    style_cell={
+                        "textAlign": "left",
+                        "padding": "8px",
+                        "fontSize": "12px",
+                        "minWidth": "100px",
+                        "maxWidth": "180px",
+                        "overflow": "hidden",
+                        "textOverflow": "ellipsis",
+                    },
+                    style_header={
+                        "fontWeight": "bold",
+                        "backgroundColor": "#eeeeee",
+                    },
+                ),
+            ]
+        )
+
+    return (
+        summary,
+        avg_price,
+        total_volume,
+        total_bags,
+        price_change,
+        tab_content,
     )
-    st.dataframe(fdf.sort_values("date", ascending=False), use_container_width=True)
-    st.download_button(
-        "Download filtered data as CSV",
-        data=fdf.to_csv(index=False).encode("utf-8"),
-        file_name="avocado_filtered.csv",
-        mime="text/csv",
+
+
+# ============================================================
+# Download callback
+# ============================================================
+
+@callback(
+    Output("download-data", "data"),
+    Input("download-button", "n_clicks"),
+    State("date-range", "start_date"),
+    State("date-range", "end_date"),
+    State("avocado-type", "value"),
+    State("regions", "value"),
+    prevent_initial_call=True,
+)
+def download_filtered_data(
+    n_clicks,
+    start_date,
+    end_date,
+    avocado_types,
+    regions,
+):
+
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+
+    if not avocado_types:
+        avocado_types = all_types
+
+    if not regions:
+        regions = sorted(
+            df["geography"].unique()
+        )
+
+    mask = (
+        (df["date"] >= start_date)
+        & (df["date"] <= end_date)
+        & (df["type"].isin(avocado_types))
+        & (df["geography"].isin(regions))
     )
+
+    download_df = df.loc[mask].copy()
+
+    return dcc.send_data_frame(
+        download_df.to_csv,
+        "avocado_filtered.csv",
+        index=False,
+    )
+
+
+# ============================================================
+# Run locally
+# ============================================================
+
+if __name__ == "__main__":
+    app.run(debug=True)
